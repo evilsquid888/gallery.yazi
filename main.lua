@@ -125,6 +125,10 @@ local function build_target_context()
 	return cwd, hovered_path, hovered_is_dir, target_dir
 end
 
+local function path_parent(path)
+	return tostring(path):match("^(.*)/[^/]+$") or ""
+end
+
 local function apply_selection_to_target(urls, target_dir, cwd, hovered_path, focus_path)
 	if not target_dir or target_dir == "" then
 		return
@@ -158,10 +162,6 @@ local function apply_selection_to_target(urls, target_dir, cwd, hovered_path, fo
 	if final_target ~= "" then
 		ya.emit("reveal", { final_target })
 	end
-end
-
-local function path_parent(path)
-	return tostring(path):match("^(.*)/[^/]+$") or ""
 end
 
 local function directory_has_images(path)

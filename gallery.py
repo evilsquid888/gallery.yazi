@@ -16,6 +16,21 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # Pillow is optional; ImageMagick or sips can be used instead.
+    Image = None
+    ImageOps = None
+
+if Image is not None:
+    try:
+        import pillow_heif  # type: ignore
+
+        pillow_heif.register_heif_opener()
+        pillow_heif.register_avif_opener()
+    except Exception:
+        pass
+
 
 SUPPORTED_EXTENSIONS = {
     ".jpg",
@@ -56,7 +71,12 @@ PREFERRED_CELL_WIDTH = 22
 MAX_GRID_COLUMNS = 8
 CELL_PIXEL_WIDTH = 24
 CELL_PIXEL_HEIGHT = 48
+# Image backends, tried in order: ImageMagick 7 (`magick`), ImageMagick 6
+# (`convert` / `identify`), Pillow, and finally macOS `sips`.
 MAGICK_PATH = shutil.which("magick")
+CONVERT_PATH = shutil.which("convert") if not MAGICK_PATH else None
+IDENTIFY_PATH = shutil.which("identify") if not MAGICK_PATH else None
+SIPS_PATH = "/usr/bin/sips" if os.path.exists("/usr/bin/sips") else None
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -196,9 +216,15 @@ def thumbnail_path(image_path: Path, canvas_width: int, canvas_height: int) -> P
 
 @lru_cache(maxsize=1024)
 def image_dimensions(image_path: str):
+    identify_cmd = None
     if MAGICK_PATH:
+        identify_cmd = [MAGICK_PATH, "identify"]
+    elif IDENTIFY_PATH:
+        identify_cmd = [IDENTIFY_PATH]
+
+    if identify_cmd:
         result = subprocess.run(
-            [MAGICK_PATH, "identify", "-ping", "-format", "%w %h", image_path],
+            identify_cmd + ["-ping", "-format", "%w %h", image_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -209,17 +235,25 @@ def image_dimensions(image_path: str):
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
                 return int(parts[0]), int(parts[1])
 
-    result = subprocess.run(
-        ["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", "-1", image_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        match = re.search(r"pixelWidth:\s*(\d+)\|pixelHeight:\s*(\d+)", result.stdout)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+    if Image is not None:
+        try:
+            with Image.open(image_path) as img:
+                return img.size
+        except Exception:
+            pass
+
+    if SIPS_PATH:
+        result = subprocess.run(
+            [SIPS_PATH, "-g", "pixelWidth", "-g", "pixelHeight", "-1", image_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            match = re.search(r"pixelWidth:\s*(\d+)\|pixelHeight:\s*(\d+)", result.stdout)
+            if match:
+                return int(match.group(1)), int(match.group(2))
 
     return None, None
 
@@ -241,38 +275,49 @@ def fit_image_cells(image_path: Path, max_cols: int, max_rows: int):
     return display_cols, display_rows
 
 
-def ensure_thumbnail(image_path: Path, canvas_width: int, canvas_height: int):
-    thumb_path = thumbnail_path(image_path, canvas_width, canvas_height)
-    if thumb_path.exists():
-        return thumb_path
+def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
+    cmd = [MAGICK_PATH] if MAGICK_PATH else [CONVERT_PATH]
+    result = subprocess.run(
+        cmd
+        + [
+            str(image_path),
+            "-auto-orient",
+            "-thumbnail",
+            f"{canvas_width}x{canvas_height}",
+            "-background",
+            "none",
+            "-gravity",
+            "center",
+            "-extent",
+            f"{canvas_width}x{canvas_height}",
+            f"png:{thumb_path}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0 and thumb_path.exists()
 
-    thumb_path.parent.mkdir(parents=True, exist_ok=True)
-    if MAGICK_PATH:
-        result = subprocess.run(
-            [
-                MAGICK_PATH,
-                str(image_path),
-                "-auto-orient",
-                "-thumbnail",
-                f"{canvas_width}x{canvas_height}",
-                "-background",
-                "none",
-                "-gravity",
-                "center",
-                "-extent",
-                f"{canvas_width}x{canvas_height}",
-                f"png:{thumb_path}",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode == 0 and thumb_path.exists():
-            return thumb_path
 
+def _thumbnail_with_pillow(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGBA")
+            img.thumbnail((canvas_width, canvas_height), Image.LANCZOS)
+            canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
+            offset = ((canvas_width - img.width) // 2, (canvas_height - img.height) // 2)
+            canvas.paste(img, offset)
+            canvas.save(thumb_path, format="PNG")
+    except Exception:
+        return False
+    return thumb_path.exists()
+
+
+def _thumbnail_with_sips(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
     result = subprocess.run(
         [
-            "/usr/bin/sips",
+            SIPS_PATH,
             "-s",
             "format",
             "png",
@@ -286,7 +331,21 @@ def ensure_thumbnail(image_path: Path, canvas_width: int, canvas_height: int):
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    if result.returncode == 0 and thumb_path.exists():
+    return result.returncode == 0 and thumb_path.exists()
+
+
+def ensure_thumbnail(image_path: Path, canvas_width: int, canvas_height: int):
+    thumb_path = thumbnail_path(image_path, canvas_width, canvas_height)
+    if thumb_path.exists():
+        return thumb_path
+
+    thumb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if (MAGICK_PATH or CONVERT_PATH) and _thumbnail_with_magick(image_path, canvas_width, canvas_height, thumb_path):
+        return thumb_path
+    if Image is not None and _thumbnail_with_pillow(image_path, canvas_width, canvas_height, thumb_path):
+        return thumb_path
+    if SIPS_PATH and _thumbnail_with_sips(image_path, canvas_width, canvas_height, thumb_path):
         return thumb_path
     return None
 
@@ -785,6 +844,14 @@ def cleanup():
 def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Gallery requires an interactive terminal.", file=sys.stderr)
+        return 1
+
+    if not (MAGICK_PATH or CONVERT_PATH or Image is not None or SIPS_PATH):
+        print(
+            "Gallery needs an image backend: install ImageMagick (`magick` or `convert`), "
+            "Pillow (`pip install pillow`), or run on macOS with `sips`.",
+            file=sys.stderr,
+        )
         return 1
 
     mode_label, source_label, all_images, start_image, initial_marked = resolve_gallery_inputs(sys.argv)

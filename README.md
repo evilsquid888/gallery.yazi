@@ -28,13 +28,16 @@ A terminal image gallery for [Yazi](https://github.com/sxyazi/yazi).
 
 ## Requirements
 
-- macOS
+- Linux or macOS
 - [Yazi](https://github.com/sxyazi/yazi)
 - A terminal that supports the Kitty graphics protocol
-  - [Ghostty](https://ghostty.org/) works well
+  - [Ghostty](https://ghostty.org/), [kitty](https://sw.kovidgoyal.net/kitty/), and [WezTerm](https://wezfurlong.org/wezterm/) work
+  - Works over SSH as long as the local terminal supports the protocol; does not work inside `tmux` or `screen`
 - `python3`
-- `sips`
-- `zsh`
+- One image backend, tried in this order:
+  - ImageMagick 7 (`magick`) or ImageMagick 6 (`convert` + `identify`)
+  - [Pillow](https://pypi.org/project/Pillow/) (`pip install pillow`; add `pillow-heif` for HEIC/AVIF)
+  - `sips` (macOS only)
 
 ## Installation
 
@@ -58,7 +61,7 @@ Add this key binding to your `~/.config/yazi/keymap.toml`:
 on   = [ "\\", "g" ]
 run  = [
   "plugin gallery -- prepare_selection",
-  "shell '/bin/zsh -f ~/.config/yazi/plugins/gallery.yazi/gallery.zsh %h' --block",
+  "shell '~/.config/yazi/plugins/gallery.yazi/gallery.sh %h' --block",
   "plugin gallery -- apply_selection"
 ]
 desc = "Gallery"
@@ -123,7 +126,7 @@ The single-image footer shows:
 
 ## Limitations
 
-- macOS-oriented implementation
+- Linux and macOS only (needs a POSIX shell and a Kitty-graphics terminal)
 - Requires a Kitty-graphics-compatible terminal for rendering
 - Current scope is intentionally local and terminal-based
 - This plugin is optimized for image review, not file editing or metadata editing
@@ -137,7 +140,7 @@ The single-image footer shows:
 
 - The current implementation is terminal-first
 - The gallery is designed to stay inside the same terminal session as Yazi
-- The plugin favors low-dependency workflows and native macOS utilities where possible
+- The plugin favors low-dependency workflows and uses whichever image backend is already installed
 
 ## License
 

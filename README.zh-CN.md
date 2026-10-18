@@ -28,13 +28,12 @@
 
 ## 依赖
 
-- macOS
+- Linux 或 macOS
 - [Yazi](https://github.com/sxyazi/yazi)
 - 支持 Kitty graphics protocol 的终端
   - [Ghostty](https://ghostty.org/) 表现良好
 - `python3`
-- `sips`
-- `zsh`
+- 图像后端之一：ImageMagick（`magick` 或 `convert`）、Pillow（`pip install pillow`）或 macOS 自带的 `sips`
 
 ## 安装
 
@@ -58,7 +57,7 @@ git clone git@github.com:FMVPJet/gallery.yazi.git \
 on   = [ "\\", "g" ]
 run  = [
   "plugin gallery -- prepare_selection",
-  "shell '/bin/zsh -f ~/.config/yazi/plugins/gallery.yazi/gallery.zsh %h' --block",
+  "shell '~/.config/yazi/plugins/gallery.yazi/gallery.sh %h' --block",
   "plugin gallery -- apply_selection"
 ]
 desc = "Gallery"
@@ -123,7 +122,7 @@ desc = "Gallery"
 
 ## 限制
 
-- 目前实现偏向 macOS
+- 支持 Linux 与 macOS
 - 渲染依赖支持 Kitty graphics protocol 的终端
 - 当前范围有意保持为本地、终端内图片浏览
 - 这个插件更偏向图片筛选，不是文件编辑器或元数据编辑器
@@ -137,7 +136,7 @@ desc = "Gallery"
 
 - 当前实现以终端优先
 - 画廊会尽量留在与 Yazi 相同的终端会话中
-- 插件优先采用低依赖和 macOS 原生工具链
+- 插件优先采用低依赖方案，自动使用系统中已安装的图像后端
 
 ## License
 
