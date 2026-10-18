@@ -10,6 +10,7 @@ import subprocess
 import sys
 import termios
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 import tty
 from datetime import datetime
@@ -87,6 +88,57 @@ TRANSMIT_MODE = os.environ.get("GALLERY_TRANSMIT") or (
     "direct" if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") else "file"
 )
 KITTY_CHUNK = 4096
+
+# Graphics protocol: "kitty" or "iterm2". WezTerm's Kitty implementation turns
+# re-placed images black, so it gets the iTerm2 inline protocol (as yazi does).
+# Decided in main() from GALLERY_PROTOCOL, $TERM_PROGRAM, or an XTVERSION query.
+PROTOCOL = "kitty"
+THUMB_FORMAT = "png"  # "jpeg" for iterm2: far fewer bytes per repaint
+
+
+def set_protocol(name: str):
+    global PROTOCOL, THUMB_FORMAT
+    PROTOCOL = name
+    THUMB_FORMAT = "jpeg" if name == "iterm2" else "png"
+
+
+def protocol_from_env():
+    forced = (os.environ.get("GALLERY_PROTOCOL") or "").strip().lower()
+    if forced in ("kitty", "iterm2"):
+        return forced
+    program = (os.environ.get("TERM_PROGRAM") or "").lower()
+    term = (os.environ.get("TERM") or "").lower()
+    if "wezterm" in program or "wezterm" in term or program in ("iterm.app", "vscode", "tabby", "warpterminal"):
+        return "iterm2"
+    if program in ("ghostty", "kitty") or "kitty" in term or "ghostty" in term:
+        return "kitty"
+    return None
+
+
+def protocol_from_xtversion(fd: int, timeout: float = 0.3):
+    """Ask the terminal for its name (CSI > q). Needed over SSH where TERM_PROGRAM is not forwarded."""
+    try:
+        os.write(sys.stdout.fileno(), b"\x1b[>q")
+    except OSError:
+        return None
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        if not select.select([fd], [], [], remaining)[0]:
+            break
+        try:
+            buf += os.read(fd, 256)
+        except OSError:
+            break
+        if b"\x1b\\" in buf:
+            break
+    text = buf.decode("utf-8", errors="ignore").lower()
+    if "wezterm" in text or "iterm2" in text:
+        return "iterm2"
+    if text:
+        return "kitty"
+    return None
 THUMB_WORKERS = max(2, min(8, os.cpu_count() or 2))
 
 
@@ -222,7 +274,7 @@ def thumbnail_path(image_path: Path, canvas_width: int, canvas_height: int) -> P
     digest = hashlib.sha1(
         f"{image_path}\0{stat.st_mtime_ns}\0{stat.st_size}\0{canvas_width}x{canvas_height}".encode("utf-8")
     ).hexdigest()
-    return thumbnail_cache_root() / f"{digest}.png"
+    return thumbnail_cache_root() / f"{digest}.{THUMB_FORMAT}"
 
 
 @lru_cache(maxsize=1024)
@@ -288,7 +340,9 @@ def fit_image_cells(image_path: Path, max_cols: int, max_rows: int):
 
 def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
     cmd = [MAGICK_PATH] if MAGICK_PATH else [CONVERT_PATH]
-    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.png")
+    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.{THUMB_FORMAT}")
+    background = "none" if THUMB_FORMAT == "png" else "black"
+    out_prefix = "png:" if THUMB_FORMAT == "png" else "jpeg:"
     result = subprocess.run(
         cmd
         + [
@@ -297,12 +351,14 @@ def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: i
             "-thumbnail",
             f"{canvas_width}x{canvas_height}",
             "-background",
-            "none",
+            background,
             "-gravity",
             "center",
             "-extent",
             f"{canvas_width}x{canvas_height}",
-            f"png:{tmp_path}",
+            "-quality",
+            "85",
+            f"{out_prefix}{tmp_path}",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -315,7 +371,7 @@ def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: i
 
 
 def _thumbnail_with_pillow(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
-    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.png")
+    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.{THUMB_FORMAT}")
     try:
         with Image.open(image_path) as img:
             if img.format == "JPEG" and img.mode in ("RGB", "L"):
@@ -324,10 +380,15 @@ def _thumbnail_with_pillow(image_path: Path, canvas_width: int, canvas_height: i
             img = ImageOps.exif_transpose(img)
             img.thumbnail((canvas_width, canvas_height), Image.BILINEAR, reducing_gap=2.0)
             img = img.convert("RGBA")
-            canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
             offset = ((canvas_width - img.width) // 2, (canvas_height - img.height) // 2)
-            canvas.paste(img, offset)
-            canvas.save(tmp_path, format="PNG", compress_level=3)
+            if THUMB_FORMAT == "png":
+                canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
+                canvas.paste(img, offset)
+                canvas.save(tmp_path, format="PNG", compress_level=3)
+            else:
+                canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+                canvas.paste(img, offset, img)
+                canvas.save(tmp_path, format="JPEG", quality=85, optimize=False)
         os.replace(tmp_path, thumb_path)
     except Exception:
         try:
@@ -344,7 +405,7 @@ def _thumbnail_with_sips(image_path: Path, canvas_width: int, canvas_height: int
             SIPS_PATH,
             "-s",
             "format",
-            "png",
+            THUMB_FORMAT,
             "-Z",
             str(min(max(canvas_width, canvas_height), THUMB_MAX_EDGE)),
             str(image_path),
@@ -456,11 +517,15 @@ def _image_id(thumb_path: Path) -> tuple:
 
 
 def clear_images():
+    if PROTOCOL != "kitty":
+        return  # inline images live in cells; clear_screen / overwriting removes them
     # Delete placements but keep transmitted image data so re-placing is instant.
     write(f"{OSC_KITTY}a=d,d=a,q=2;{ST}")
 
 
 def free_images():
+    if PROTOCOL != "kitty":
+        return
     for image_id in _image_ids.values():
         write(f"{OSC_KITTY}a=d,d=I,i={image_id},q=2;{ST}")
     _image_ids.clear()
@@ -480,6 +545,26 @@ def hide_cursor():
 
 def show_cursor():
     write(f"{CSI}?25h")
+
+
+def iterm2_image(path: Path, row: int, column: int, cols: int, rows: int):
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return
+    payload = base64.b64encode(raw).decode("ascii")
+    move_cursor(row, column)
+    write(
+        f"{ESC}]1337;File=inline=1;size={len(raw)};width={cols};height={rows};"
+        f"preserveAspectRatio=0;doNotMoveCursor=1:{payload}\a"
+    )
+
+
+def place_image(path: Path, row: int, column: int, cols: int, rows: int):
+    if PROTOCOL == "iterm2":
+        iterm2_image(path, row, column, cols, rows)
+    else:
+        kitty_image(path, row, column, cols, rows)
 
 
 def kitty_image(path: Path, row: int, column: int, cols: int, rows: int):
@@ -587,12 +672,12 @@ def draw_cell_overlay(image_path: Path, index: int, selected_page_index: int, ma
     row, column = cell_position(index, grid_columns, thumb_cols, thumb_rows)
     is_marked = str(image_path) in marked_paths
 
+    clear_cell_overlay(row, column, thumb_cols, thumb_rows)
+
     if repaint_image:
         thumb_path = ensure_thumbnail(image_path, canvas_width, canvas_height)
         if thumb_path is not None:
-            kitty_image(thumb_path, row, column, thumb_cols, thumb_rows)
-
-    clear_cell_overlay(row, column, thumb_cols, thumb_rows)
+            place_image(thumb_path, row, column, thumb_cols, thumb_rows)
 
     if is_marked and index != selected_page_index:
         draw_mark_frame(row, column, thumb_cols, thumb_rows)
@@ -799,15 +884,9 @@ def render_page(mode_label: str, source_label: str, images, marked_paths, show_m
         hide_cursor()
 
     if redraw_images:
-        thumbs = ensure_thumbnails(page_items, canvas_width, canvas_height)
+        ensure_thumbnails(page_items, canvas_width, canvas_height)  # warm the cache in parallel
         for index, image_path in enumerate(page_items):
-            row = TOP_MARGIN + 1 + (index // grid_columns) * (thumb_rows + LABEL_LINES + GAP_Y)
-            column = 1 + (index % grid_columns) * (thumb_cols + GAP_X)
-            thumb_path = thumbs.get(image_path)
-            if thumb_path is None:
-                continue
-            kitty_image(thumb_path, row, column, thumb_cols, thumb_rows)
-            draw_cell_overlay(image_path, index, selected_page_index, marked_paths, view)
+            draw_cell_overlay(image_path, index, selected_page_index, marked_paths, view, repaint_image=True)
     elif can_incremental:
         hide_cursor()
         changed_indices = set()
@@ -872,7 +951,7 @@ def render_single_view(mode_label: str, source_label: str, images, selected_inde
     if thumb_path is not None:
         top_row = max(1, 1 + (image_rows - display_rows) // 2)
         left_col = max(1, 1 + (image_cols - display_cols) // 2)
-        kitty_image(thumb_path, top_row, left_col, display_cols, display_rows)
+        place_image(thumb_path, top_row, left_col, display_cols, display_rows)
 
     status_row = max(1, total_lines - 3)
     meta_row = max(1, total_lines - 2)
@@ -959,6 +1038,7 @@ def main():
 
     try:
         with RawTerminal() as fd:
+            set_protocol(protocol_from_env() or protocol_from_xtversion(fd) or "kitty")
             preload_thread = None
             mode = "grid"
             viewport_row_start = 0

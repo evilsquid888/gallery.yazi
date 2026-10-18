@@ -34,6 +34,7 @@ A terminal image gallery for [Yazi](https://github.com/sxyazi/yazi).
   - [Ghostty](https://ghostty.org/), [kitty](https://sw.kovidgoyal.net/kitty/), and [WezTerm](https://wezfurlong.org/wezterm/) work
   - Works over SSH as long as the local terminal supports the protocol; does not work inside `tmux` or `screen`
     - Over SSH the plugin streams image data inline (`GALLERY_TRANSMIT=direct`, auto-detected); locally it hands the terminal a file path (`GALLERY_TRANSMIT=file`)
+  - WezTerm, iTerm2 and other terminals that speak the iTerm2 inline-image protocol are also supported. The plugin asks the terminal which it is at startup; force it with `GALLERY_PROTOCOL=kitty` or `GALLERY_PROTOCOL=iterm2`
 - `python3`
 - One image backend, tried in this order:
   - ImageMagick 7 (`magick`) or ImageMagick 6 (`convert` + `identify`)
