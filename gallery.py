@@ -49,7 +49,7 @@ SUPPORTED_EXTENSIONS = {
 TOP_MARGIN = 1
 FOOTER_LINES = 4
 GAP_X = 2
-GAP_Y = 1
+GAP_Y = 2  # one row for the frame bottom, one of breathing room
 THUMB_MAX_EDGE = 640
 LABEL_LINES = 1
 FULL_MAX_EDGE = 2048
@@ -94,6 +94,22 @@ KITTY_CHUNK = 4096
 # Decided in main() from GALLERY_PROTOCOL, $TERM_PROGRAM, or an XTVERSION query.
 PROTOCOL = "kitty"
 THUMB_FORMAT = "png"  # "jpeg" for iterm2: far fewer bytes per repaint
+
+# Whether an already-transmitted Kitty image can be re-placed with a=p. kitty
+# and Ghostty handle this; WezTerm builds on libghostty render such placements
+# black, so there every repaint retransmits the image. GALLERY_KITTY_REUSE=0|1
+# overrides the detection.
+REUSE_PLACEMENTS = True
+
+
+def set_reuse_placements(value: bool):
+    global REUSE_PLACEMENTS
+    forced = (os.environ.get("GALLERY_KITTY_REUSE") or "").strip().lower()
+    if forced in ("0", "false", "no"):
+        value = False
+    elif forced in ("1", "true", "yes"):
+        value = True
+    REUSE_PLACEMENTS = value
 
 
 DEBUG_LOG = os.environ.get("GALLERY_DEBUG")
@@ -151,6 +167,10 @@ def protocol_from_xtversion(fd: int, timeout: float = 0.3):
     debug(f"xtversion reply: {buf!r}")
     if "wezterm" in text or "iterm2" in text:
         return "iterm2"
+    if "libghostty" in text:
+        # An embedding of libghostty (e.g. recent WezTerm), not Ghostty itself.
+        set_reuse_placements(False)
+        return "kitty"
     if text:
         return "kitty"
     return None
@@ -589,9 +609,9 @@ def kitty_image(path: Path, row: int, column: int, cols: int, rows: int):
     image_id, transmitted = _image_id(path)
     move_cursor(row, column)
     placement = f"i={image_id},c={cols},r={rows},C=1,q=2"
-    debug(f"kitty: {'place' if transmitted else 'transmit'} id={image_id} {path.name} at r{row} c{column} {cols}x{rows}")
+    debug(f"kitty: {'place' if transmitted and REUSE_PLACEMENTS else 'transmit'} id={image_id} {path.name} at r{row} c{column} {cols}x{rows}")
 
-    if transmitted:
+    if transmitted and REUSE_PLACEMENTS:
         write(f"{OSC_KITTY}a=p,{placement};{ST}")
         return
 
@@ -620,11 +640,10 @@ def clear_rect(row: int, column: int, width: int, height: int):
         write(blank)
 
 
-def draw_selection_frame(row: int, column: int, width: int, image_height: int):
-    top_row = row
-    bottom_row = row + image_height - 1
-    left_col = column
-    right_col = column + max(0, width) - 1
+def draw_selection_frame(row: int, column: int, thumb_cols: int, thumb_rows: int):
+    top_row, left_col, width, height = frame_geometry(row, column, thumb_cols, thumb_rows)
+    bottom_row = top_row + height - 1
+    right_col = left_col + width - 1
     inner_width = max(0, width - 2)
 
     move_cursor(top_row, left_col)
@@ -639,11 +658,10 @@ def draw_selection_frame(row: int, column: int, width: int, image_height: int):
         write(f"{BORDER_STYLE}║{RESET}")
 
 
-def draw_mark_frame(row: int, column: int, width: int, image_height: int):
-    top_row = row
-    bottom_row = row + image_height - 1
-    left_col = column
-    right_col = column + max(0, width) - 1
+def draw_mark_frame(row: int, column: int, thumb_cols: int, thumb_rows: int):
+    top_row, left_col, width, height = frame_geometry(row, column, thumb_cols, thumb_rows)
+    bottom_row = top_row + height - 1
+    right_col = left_col + width - 1
     inner_width = max(0, width - 2)
 
     move_cursor(top_row, left_col)
@@ -664,20 +682,27 @@ def marked_label(name: str, width: int, is_marked: bool) -> str:
 
 
 def cell_position(index: int, grid_columns: int, thumb_cols: int, thumb_rows: int):
+    """Top-left cell of the image itself. The frame ring sits one cell outside it."""
     row = TOP_MARGIN + 1 + (index // grid_columns) * (thumb_rows + LABEL_LINES + GAP_Y)
-    column = 1 + (index % grid_columns) * (thumb_cols + GAP_X)
+    column = 2 + (index % grid_columns) * (thumb_cols + GAP_X)
     return row, column
 
 
+def frame_geometry(row: int, column: int, thumb_cols: int, thumb_rows: int):
+    """The ring around the image and its label: (top_row, left_col, width, height)."""
+    return row - 1, column - 1, thumb_cols + 2, thumb_rows + LABEL_LINES + 2
+
+
 def clear_cell_overlay(row: int, column: int, thumb_cols: int, thumb_rows: int):
-    clear_rect(row, column, thumb_cols, 1)
-    if thumb_rows > 1:
-        for inner_row in range(row + 1, row + thumb_rows - 1):
-            move_cursor(inner_row, column)
-            write(" ")
-            move_cursor(inner_row, column + thumb_cols - 1)
-            write(" ")
-        clear_rect(row + thumb_rows - 1, column, thumb_cols, 1)
+    """Blank the frame ring and the label line without touching the image cells."""
+    top, left, width, height = frame_geometry(row, column, thumb_cols, thumb_rows)
+    clear_rect(top, left, width, 1)
+    clear_rect(top + height - 1, left, width, 1)
+    for inner_row in range(top + 1, top + height - 1):
+        move_cursor(inner_row, left)
+        write(" ")
+        move_cursor(inner_row, left + width - 1)
+        write(" ")
     move_cursor(row + thumb_rows, column)
     write(" " * thumb_cols)
 
@@ -720,17 +745,20 @@ def page_geometry():
     size = shutil.get_terminal_size(fallback=(120, 40))
     usable_lines = max(1, size.lines - FOOTER_LINES - TOP_MARGIN)
 
-    columns = max(1, min(MAX_GRID_COLUMNS, (size.columns + GAP_X) // (PREFERRED_CELL_WIDTH + GAP_X)))
-    thumb_cols = max(1, (size.columns - GAP_X * (columns - 1)) // columns)
+    # Each tile block is (thumb_cols + 2) wide and (thumb_rows + LABEL_LINES + 2) tall:
+    # a one-cell frame ring around the image plus its label line.
+    frame_width = size.columns - 2
+    columns = max(1, min(MAX_GRID_COLUMNS, (frame_width + GAP_X) // (PREFERRED_CELL_WIDTH + GAP_X)))
+    thumb_cols = max(1, (frame_width - GAP_X * (columns - 1)) // columns)
 
     while columns > 1 and thumb_cols < MIN_THUMB_COLS:
         columns -= 1
-        thumb_cols = max(1, (size.columns - GAP_X * (columns - 1)) // columns)
+        thumb_cols = max(1, (frame_width - GAP_X * (columns - 1)) // columns)
 
     thumb_cols = clamp(thumb_cols, MIN_THUMB_COLS, MAX_THUMB_COLS)
     thumb_rows = clamp(round(thumb_cols * 0.55), 5, 12)
     cell_height = thumb_rows + LABEL_LINES + GAP_Y
-    rows = max(1, (usable_lines + GAP_Y) // cell_height)
+    rows = max(1, (usable_lines + 1) // cell_height)
     canvas_width = clamp(thumb_cols * CELL_PIXEL_WIDTH, 240, THUMB_MAX_EDGE)
     canvas_height = clamp(thumb_rows * CELL_PIXEL_HEIGHT, 240, THUMB_MAX_EDGE)
     return size.columns, size.lines, columns, rows, thumb_cols, thumb_rows, canvas_width, canvas_height
@@ -920,7 +948,7 @@ def render_page(mode_label: str, source_label: str, images, marked_paths, show_m
 
         for index in sorted(changed_indices):
             if 0 <= index < len(page_items):
-                draw_cell_overlay(page_items[index], index, selected_page_index, marked_paths, view, repaint_image=True)
+                draw_cell_overlay(page_items[index], index, selected_page_index, marked_paths, view, repaint_image=False)
     else:
         clear_screen()
         hide_cursor()
@@ -1058,8 +1086,9 @@ def main():
     try:
         with RawTerminal() as fd:
             set_protocol(protocol_from_env() or protocol_from_xtversion(fd) or "kitty")
+            set_reuse_placements(REUSE_PLACEMENTS)
             debug(
-                f"start: protocol={PROTOCOL} transmit={TRANSMIT_MODE} thumb={THUMB_FORMAT} "
+                f"start: protocol={PROTOCOL} transmit={TRANSMIT_MODE} thumb={THUMB_FORMAT} reuse={REUSE_PLACEMENTS} "
                 f"TERM={os.environ.get('TERM')!r} TERM_PROGRAM={os.environ.get('TERM_PROGRAM')!r} "
                 f"size={shutil.get_terminal_size(fallback=(0, 0))} images={len(all_images)} "
                 f"backends=magick:{bool(MAGICK_PATH)} convert:{bool(CONVERT_PATH)} pillow:{Image is not None} sips:{bool(SIPS_PATH)}"
@@ -1149,7 +1178,6 @@ def main():
                     else:
                         marked_paths.add(current)
                     selected_path = images[selected_index]
-                    previous_marked_paths = None
                     continue
                 if key in {"m", "M"}:
                     if show_marked_only:
