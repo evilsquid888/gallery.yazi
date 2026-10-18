@@ -33,6 +33,7 @@ A terminal image gallery for [Yazi](https://github.com/sxyazi/yazi).
 - A terminal that supports the Kitty graphics protocol
   - [Ghostty](https://ghostty.org/), [kitty](https://sw.kovidgoyal.net/kitty/), and [WezTerm](https://wezfurlong.org/wezterm/) work
   - Works over SSH as long as the local terminal supports the protocol; does not work inside `tmux` or `screen`
+    - Over SSH the plugin streams image data inline (`GALLERY_TRANSMIT=direct`, auto-detected); locally it hands the terminal a file path (`GALLERY_TRANSMIT=file`)
 - `python3`
 - One image backend, tried in this order:
   - ImageMagick 7 (`magick`) or ImageMagick 6 (`convert` + `identify`)

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import termios
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import tty
 from datetime import datetime
 from functools import lru_cache
@@ -77,6 +78,16 @@ MAGICK_PATH = shutil.which("magick")
 CONVERT_PATH = shutil.which("convert") if not MAGICK_PATH else None
 IDENTIFY_PATH = shutil.which("identify") if not MAGICK_PATH else None
 SIPS_PATH = "/usr/bin/sips" if os.path.exists("/usr/bin/sips") else None
+
+# How thumbnails reach the terminal. "file" hands the terminal a path (fast,
+# local only). "direct" streams the PNG bytes inline, which is what you need
+# over SSH because the terminal cannot read the remote file. Override with
+# GALLERY_TRANSMIT=file|direct.
+TRANSMIT_MODE = os.environ.get("GALLERY_TRANSMIT") or (
+    "direct" if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") else "file"
+)
+KITTY_CHUNK = 4096
+THUMB_WORKERS = max(2, min(8, os.cpu_count() or 2))
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -277,6 +288,7 @@ def fit_image_cells(image_path: Path, max_cols: int, max_rows: int):
 
 def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
     cmd = [MAGICK_PATH] if MAGICK_PATH else [CONVERT_PATH]
+    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.png")
     result = subprocess.run(
         cmd
         + [
@@ -290,26 +302,38 @@ def _thumbnail_with_magick(image_path: Path, canvas_width: int, canvas_height: i
             "center",
             "-extent",
             f"{canvas_width}x{canvas_height}",
-            f"png:{thumb_path}",
+            f"png:{tmp_path}",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    return result.returncode == 0 and thumb_path.exists()
+    if result.returncode == 0 and tmp_path.exists():
+        os.replace(tmp_path, thumb_path)
+        return True
+    return False
 
 
 def _thumbnail_with_pillow(image_path: Path, canvas_width: int, canvas_height: int, thumb_path: Path) -> bool:
+    tmp_path = thumb_path.with_name(f"{thumb_path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.png")
     try:
         with Image.open(image_path) as img:
+            if img.format == "JPEG" and img.mode in ("RGB", "L"):
+                # Let libjpeg decode at 1/2, 1/4 or 1/8 scale; much faster than a full decode.
+                img.draft(img.mode, (canvas_width * 2, canvas_height * 2))
             img = ImageOps.exif_transpose(img)
+            img.thumbnail((canvas_width, canvas_height), Image.BILINEAR, reducing_gap=2.0)
             img = img.convert("RGBA")
-            img.thumbnail((canvas_width, canvas_height), Image.LANCZOS)
             canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
             offset = ((canvas_width - img.width) // 2, (canvas_height - img.height) // 2)
             canvas.paste(img, offset)
-            canvas.save(thumb_path, format="PNG")
+            canvas.save(tmp_path, format="PNG", compress_level=3)
+        os.replace(tmp_path, thumb_path)
     except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
         return False
     return thumb_path.exists()
 
@@ -350,12 +374,22 @@ def ensure_thumbnail(image_path: Path, canvas_width: int, canvas_height: int):
     return None
 
 
+_thumb_pool = ThreadPoolExecutor(max_workers=THUMB_WORKERS, thread_name_prefix="gallery-thumb")
+
+
+def ensure_thumbnails(image_paths, canvas_width: int, canvas_height: int):
+    """Generate thumbnails for several images in parallel; returns {path: thumb_path or None}."""
+    paths = list(image_paths)
+    if not paths:
+        return {}
+    results = list(_thumb_pool.map(lambda ip: ensure_thumbnail(ip, canvas_width, canvas_height), paths))
+    return dict(zip(paths, results))
+
+
 def preload_thumbnails(image_paths, canvas_width: int, canvas_height: int):
     if not image_paths:
         return
-
-    for image_path in image_paths:
-        ensure_thumbnail(image_path, canvas_width, canvas_height)
+    ensure_thumbnails(image_paths, canvas_width, canvas_height)
 
 
 def row_image_paths(images, row_start: int, row_count: int, grid_columns: int):
@@ -403,8 +437,33 @@ def flush():
     sys.stdout.flush()
 
 
+_image_ids = {}
+_image_id_base = (os.getpid() % 4000) * 1000 + 1  # keep clear of ids other apps are likely using
+
+
+def _image_id(thumb_path: Path) -> tuple:
+    """Return (id, already_transmitted). Ids are keyed on path+mtime so a regenerated thumb gets a new id."""
+    try:
+        key = (str(thumb_path), thumb_path.stat().st_mtime_ns)
+    except OSError:
+        key = (str(thumb_path), 0)
+    image_id = _image_ids.get(key)
+    if image_id is not None:
+        return image_id, True
+    image_id = _image_id_base + len(_image_ids)
+    _image_ids[key] = image_id
+    return image_id, False
+
+
 def clear_images():
-    write(f"{OSC_KITTY}a=d,d=A,q=2;{ST}")
+    # Delete placements but keep transmitted image data so re-placing is instant.
+    write(f"{OSC_KITTY}a=d,d=a,q=2;{ST}")
+
+
+def free_images():
+    for image_id in _image_ids.values():
+        write(f"{OSC_KITTY}a=d,d=I,i={image_id},q=2;{ST}")
+    _image_ids.clear()
 
 
 def clear_screen():
@@ -424,9 +483,30 @@ def show_cursor():
 
 
 def kitty_image(path: Path, row: int, column: int, cols: int, rows: int):
-    payload = base64.b64encode(str(path).encode("utf-8")).decode("ascii")
+    image_id, transmitted = _image_id(path)
     move_cursor(row, column)
-    write(f"{OSC_KITTY}a=T,f=100,t=f,c={cols},r={rows},C=1,q=2;{payload}{ST}")
+    placement = f"i={image_id},c={cols},r={rows},C=1,q=2"
+
+    if transmitted:
+        write(f"{OSC_KITTY}a=p,{placement};{ST}")
+        return
+
+    if TRANSMIT_MODE == "file":
+        payload = base64.b64encode(str(path).encode("utf-8")).decode("ascii")
+        write(f"{OSC_KITTY}a=T,f=100,t=f,{placement};{payload}{ST}")
+        return
+
+    try:
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return
+    chunks = [data[i:i + KITTY_CHUNK] for i in range(0, len(data), KITTY_CHUNK)] or [""]
+    for index, chunk in enumerate(chunks):
+        more = 1 if index < len(chunks) - 1 else 0
+        if index == 0:
+            write(f"{OSC_KITTY}a=T,f=100,t=d,{placement},m={more};{chunk}{ST}")
+        else:
+            write(f"{OSC_KITTY}m={more};{chunk}{ST}")
 
 
 def clear_rect(row: int, column: int, width: int, height: int):
@@ -719,10 +799,11 @@ def render_page(mode_label: str, source_label: str, images, marked_paths, show_m
         hide_cursor()
 
     if redraw_images:
+        thumbs = ensure_thumbnails(page_items, canvas_width, canvas_height)
         for index, image_path in enumerate(page_items):
             row = TOP_MARGIN + 1 + (index // grid_columns) * (thumb_rows + LABEL_LINES + GAP_Y)
             column = 1 + (index % grid_columns) * (thumb_cols + GAP_X)
-            thumb_path = ensure_thumbnail(image_path, canvas_width, canvas_height)
+            thumb_path = thumbs.get(image_path)
             if thumb_path is None:
                 continue
             kitty_image(thumb_path, row, column, thumb_cols, thumb_rows)
@@ -836,6 +917,7 @@ def render_single_view(mode_label: str, source_label: str, images, selected_inde
 
 def cleanup():
     clear_images()
+    free_images()
     clear_screen()
     show_cursor()
     flush()
