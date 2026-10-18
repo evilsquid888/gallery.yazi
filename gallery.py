@@ -96,6 +96,20 @@ PROTOCOL = "kitty"
 THUMB_FORMAT = "png"  # "jpeg" for iterm2: far fewer bytes per repaint
 
 
+DEBUG_LOG = os.environ.get("GALLERY_DEBUG")
+
+
+def debug(message: str):
+    if not DEBUG_LOG:
+        return
+    path = DEBUG_LOG if DEBUG_LOG not in ("1", "true", "yes") else os.path.join(os.environ.get("TMPDIR") or "/tmp", "gallery-yazi-debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {message}\n")
+    except OSError:
+        pass
+
+
 def set_protocol(name: str):
     global PROTOCOL, THUMB_FORMAT
     PROTOCOL = name
@@ -134,6 +148,7 @@ def protocol_from_xtversion(fd: int, timeout: float = 0.3):
         if b"\x1b\\" in buf:
             break
     text = buf.decode("utf-8", errors="ignore").lower()
+    debug(f"xtversion reply: {buf!r}")
     if "wezterm" in text or "iterm2" in text:
         return "iterm2"
     if text:
@@ -423,6 +438,7 @@ def ensure_thumbnail(image_path: Path, canvas_width: int, canvas_height: int):
     thumb_path = thumbnail_path(image_path, canvas_width, canvas_height)
     if thumb_path.exists():
         return thumb_path
+    debug(f"thumb: generating {image_path.name} -> {canvas_width}x{canvas_height}")
 
     thumb_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -551,7 +567,9 @@ def iterm2_image(path: Path, row: int, column: int, cols: int, rows: int):
     try:
         raw = path.read_bytes()
     except OSError:
+        debug(f"iterm2: cannot read {path}")
         return
+    debug(f"iterm2: place {path.name} at r{row} c{column} {cols}x{rows} cells, {len(raw)} bytes")
     payload = base64.b64encode(raw).decode("ascii")
     move_cursor(row, column)
     write(
@@ -571,6 +589,7 @@ def kitty_image(path: Path, row: int, column: int, cols: int, rows: int):
     image_id, transmitted = _image_id(path)
     move_cursor(row, column)
     placement = f"i={image_id},c={cols},r={rows},C=1,q=2"
+    debug(f"kitty: {'place' if transmitted else 'transmit'} id={image_id} {path.name} at r{row} c{column} {cols}x{rows}")
 
     if transmitted:
         write(f"{OSC_KITTY}a=p,{placement};{ST}")
@@ -1039,6 +1058,12 @@ def main():
     try:
         with RawTerminal() as fd:
             set_protocol(protocol_from_env() or protocol_from_xtversion(fd) or "kitty")
+            debug(
+                f"start: protocol={PROTOCOL} transmit={TRANSMIT_MODE} thumb={THUMB_FORMAT} "
+                f"TERM={os.environ.get('TERM')!r} TERM_PROGRAM={os.environ.get('TERM_PROGRAM')!r} "
+                f"size={shutil.get_terminal_size(fallback=(0, 0))} images={len(all_images)} "
+                f"backends=magick:{bool(MAGICK_PATH)} convert:{bool(CONVERT_PATH)} pillow:{Image is not None} sips:{bool(SIPS_PATH)}"
+            )
             preload_thread = None
             mode = "grid"
             viewport_row_start = 0
@@ -1104,6 +1129,7 @@ def main():
                     previous_marked_paths = None
 
                 key = read_key(fd)
+                debug(f"key={key!r} mode={mode} selected={selected_index} marked={len(marked_paths)}")
 
                 if key in {"q", "Q", "ESC", "EOF"}:
                     if mode == "single" and key != "Q":
